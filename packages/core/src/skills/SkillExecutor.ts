@@ -5,7 +5,17 @@ import type { RAGPipeline } from '../rag/RAGPipeline.js';
 import type { Tool, ToolCall, ToolResult, SkillResult, RAGContext, Message } from '../types.js';
 import type { SkillConfig } from '../config/schemas.js';
 
-const MAX_TOOL_ROUNDS = 8;
+const MAX_TOOL_ROUNDS = 6;
+// Cap each tool result fed back to the LLM. Raw MCP results (Kafka dumps, DB
+// records, log searches) can be huge, and the full message history is re-sent
+// on every tool round — the dominant driver of token usage. Truncating keeps
+// investigations within free-tier token/minute and token/day limits.
+const MAX_TOOL_RESULT_CHARS = 1500;
+
+function truncate(text: string, max: number): string {
+  if (text.length <= max) return text;
+  return `${text.slice(0, max)}\n…[truncated ${text.length - max} chars]`;
+}
 
 export class SkillExecutor {
   constructor(
@@ -33,7 +43,7 @@ export class SkillExecutor {
     const queryText = [inputs['description'], inputs['title'], inputs['query']]
       .filter(Boolean).join(' ') || userPrompt.slice(0, 400);
     let ragCtx: RAGContext;
-    try { ragCtx = await this.rag.query(queryText); }
+    try { ragCtx = await this.rag.query(queryText, { topK: 4 }); }
     catch { ragCtx = emptyRAG(); }
 
     // Build messages — system carries RAG context, user carries rendered prompt
@@ -76,7 +86,8 @@ export class SkillExecutor {
           console.log(`[SkillExecutor] Calling tool: ${tc.name}`, JSON.stringify(tc.arguments));
           const result = await this.callTool!(tc.name, tc.arguments);
           console.log(`[SkillExecutor] Tool result (${tc.name}): ${result.content.slice(0, 300)}`);
-          messages.push({ role: 'tool', content: result.content, tool_results: [result] });
+          const trimmed = truncate(result.content, MAX_TOOL_RESULT_CHARS);
+          messages.push({ role: 'tool', content: trimmed, tool_results: [{ ...result, content: trimmed }] });
           totalToolCallsMade++;
         }
       }
