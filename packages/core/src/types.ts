@@ -47,6 +47,12 @@ export interface ChatOptions {
   temperature?: number;
   max_tokens?: number;
   stop_sequences?: string[];
+  /**
+   * Request the model return a single JSON object (OpenAI-compatible
+   * `response_format: { type: "json_object" }`). Adapters that don't support it
+   * ignore this flag. Cannot be combined with tool calls in the same request.
+   */
+  json_mode?: boolean;
 }
 
 export interface LLMChunk {

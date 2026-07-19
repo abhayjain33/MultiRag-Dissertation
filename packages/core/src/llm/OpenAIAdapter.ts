@@ -48,6 +48,10 @@ export class OpenAIAdapter implements LLMProvider {
         stream: true,
         ...(openaiTools?.length ? { tools: openaiTools } : {}),
         ...(options?.stop_sequences ? { stop: options.stop_sequences } : {}),
+        // JSON mode can't be combined with tool calls in one request.
+        ...(options?.json_mode && !openaiTools?.length
+          ? { response_format: { type: 'json_object' as const } }
+          : {}),
       }),
     );
 

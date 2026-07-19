@@ -3,6 +3,7 @@ export { AnthropicAdapter } from './AnthropicAdapter.js';
 export { OpenAIAdapter } from './OpenAIAdapter.js';
 export { AzureOpenAIAdapter } from './AzureOpenAIAdapter.js';
 export { OllamaAdapter } from './OllamaAdapter.js';
+export { CachingEmbedder } from './CachingEmbedder.js';
 
 import type { LLMConfig } from '../config/schemas.js';
 import type { LLMProvider } from './LLMProvider.js';

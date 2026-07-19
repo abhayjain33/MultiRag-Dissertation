@@ -96,11 +96,36 @@ export class SkillExecutor {
     // Parse output for structured format
     let output: Record<string, unknown> = { text: fullText };
     if (this.skill.output.format === 'structured') {
-      const m = /```json\s*([\s\S]+?)\s*```/i.exec(fullText) ?? /(\{[\s\S]+\})/s.exec(fullText);
-      if (m?.[1]) {
-        try { output = JSON.parse(m[1]) as Record<string, unknown>; }
-        catch { output = { text: fullText }; }
+      let parsed = extractJson(fullText);
+
+      // Retry once in JSON mode if the model didn't return valid JSON. Send only
+      // the prior answer (not the full tool history) to keep the retry cheap.
+      if (!parsed) {
+        console.log(`[SkillExecutor] ${this.skill.id}: invalid JSON — retrying in JSON mode`);
+        try {
+          const retryMessages: Message[] = [
+            {
+              role: 'user',
+              content:
+                'Convert the following into ONLY the JSON object required for this skill. ' +
+                'Output nothing but the JSON — no prose, no code fences.\n\n' + fullText,
+            },
+          ];
+          let retryText = '';
+          for await (const chunk of this.llm.chat(retryMessages, undefined, { ...llmOpts, json_mode: true })) {
+            if (chunk.type === 'text' && chunk.text) retryText += chunk.text;
+          }
+          const retryParsed = extractJson(retryText);
+          if (retryParsed) { parsed = retryParsed; fullText = retryText; }
+        } catch (e) {
+          return this.failure(`LLM error during JSON retry: ${String(e)}`, t0, ragCtx);
+        }
       }
+
+      if (!parsed) {
+        return this.failure('Skill output was not valid JSON after retry', t0, ragCtx);
+      }
+      output = parsed;
     }
 
     return {
@@ -126,11 +151,27 @@ export class SkillExecutor {
   }
 }
 
-function renderTemplate(template: string, inputs: Record<string, unknown>): string {
-  // Flatten dot-notation keys so {{ticket.chain_context}} resolves from inputs['ticket.chain_context']
+export function renderTemplate(template: string, inputs: Record<string, unknown>): string {
+  // Flatten dot-notation keys so {{ticket.chain_context}} resolves from inputs['ticket.chain_context'].
+  // Unresolved placeholders are blanked rather than left as literal {{key}}, which
+  // would otherwise confuse the model.
   return template.replace(/\{\{([\w.]+)\}\}/g, (_, key: string) =>
-    key in inputs ? String(inputs[key]) : `{{${key}}}`,
+    key in inputs ? String(inputs[key]) : '',
   );
+}
+
+/** Extract a JSON object from an LLM reply (fenced ```json block or a bare object). */
+export function extractJson(text: string): Record<string, unknown> | null {
+  const m = /```json\s*([\s\S]+?)\s*```/i.exec(text) ?? /(\{[\s\S]+\})/s.exec(text);
+  if (!m?.[1]) return null;
+  try {
+    const parsed = JSON.parse(m[1]);
+    return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 function emptyRAG(): RAGContext {

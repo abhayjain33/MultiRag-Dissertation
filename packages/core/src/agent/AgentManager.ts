@@ -2,6 +2,7 @@ import { dirname, resolve } from 'node:path';
 import { EventEmitter } from 'node:events';
 import { ConfigValidator } from '../config/ConfigValidator.js';
 import { createLLMProvider } from '../llm/index.js';
+import { CachingEmbedder } from '../llm/CachingEmbedder.js';
 import { MarkdownProcessor } from '../knowledge/markdown/MarkdownProcessor.js';
 import { FolderProcessor } from '../knowledge/folder/FolderProcessor.js';
 import { GraphProcessor } from '../knowledge/graph/GraphProcessor.js';
@@ -51,11 +52,22 @@ export class AgentManager extends EventEmitter {
 
     // 2. LLM provider (chat) + embedding provider (RAG).
     // If `embedding` is configured, use a dedicated provider for embeddings;
-    // otherwise reuse the chat provider for both.
+    // otherwise reuse the chat provider for both. The embedder is wrapped in a
+    // disk-backed cache so unchanged KB content isn't re-embedded on every restart.
     this.llm = createLLMProvider(this.config.llm);
-    this.embedder = this.config.embedding
+    const baseEmbedder = this.config.embedding
       ? createLLMProvider(this.config.embedding)
       : this.llm;
+    const embConfig = this.config.embedding ?? this.config.llm;
+    const embNamespace = embConfig.embedding_model ?? embConfig.model;
+    const cacheDir = this.config.knowledge?.vector_store_path
+      ? resolve(this.configDir, this.config.knowledge.vector_store_path)
+      : resolve(this.configDir, 'data');
+    this.embedder = new CachingEmbedder(
+      baseEmbedder,
+      resolve(cacheDir, 'embedding-cache.json'),
+      embNamespace,
+    );
 
     // 3. Knowledge sources + RAG
     // Resolve each source's `path` against the config file's directory so that
@@ -128,6 +140,15 @@ export class AgentManager extends EventEmitter {
     await this.server.listen(port);
 
     this.running = true;
+
+    // Re-arm escalation timers for tickets that were still open at last shutdown,
+    // so a restart doesn't leave them stranded without an escalation deadline.
+    if (this.config.routing?.escalate_after_minutes) {
+      for (const t of this.store.listTickets()) {
+        if (t.status === 'open') this.scheduleEscalationTimer(t);
+      }
+    }
+
     console.log(`[AgentManager] Agent ${this.config.agent.name} ready on port ${port}`);
   }
 
@@ -451,13 +472,17 @@ export class AgentManager extends EventEmitter {
   private scheduleEscalationTimer(ticket: Ticket): void {
     const mins = this.config.routing?.escalate_after_minutes;
     if (!mins) return;
+    // Fire relative to when the ticket was created, so timers survive a restart:
+    // an overdue ticket escalates immediately (delay 0), a fresh one after `mins`.
+    const deadline = new Date(ticket.created_at).getTime() + mins * 60 * 1000;
+    const delay = Math.max(0, deadline - Date.now());
     setTimeout(async () => {
       if (!this.running) return;
       const current = this.store.getTicket(ticket.id);
       if (!current || current.status !== 'open') return;
       const target = this.config.routing?.escalate_to;
       await this.escalate(current, `Auto-escalated after ${mins} minutes`, target);
-    }, mins * 60 * 1000);
+    }, delay);
   }
 
   private sendWS(event: AgentWSEvent): void {

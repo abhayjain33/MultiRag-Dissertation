@@ -15,10 +15,12 @@ export class AgentRouter {
       if (routing.escalate_on_skill && skillId === routing.escalate_on_skill && routing.escalate_to) {
         return { action: 'escalate', target_agent: routing.escalate_to, reason: `${skillId} complete — escalating to ${routing.escalate_to}` };
       }
-      // Legacy: escalate if the LLM output explicitly says ESCALATE
+      // Escalate only if the skill's structured output explicitly decides so.
+      // (Previously a substring match on the whole payload, so any skill that
+      // merely mentioned "escalate" in a summary field triggered escalation.)
       if (routing.escalate_on_skill) {
         const decision = String(skillOutput['decision'] ?? '').toUpperCase();
-        if (decision === 'ESCALATE' || JSON.stringify(skillOutput).toUpperCase().includes('"ESCALATE"')) {
+        if (decision === 'ESCALATE') {
           const target = routing.escalate_to;
           if (target) return { action: 'escalate', target_agent: target, reason: 'Skill flagged escalation' };
           return { action: 'escalate', reason: 'Skill flagged escalation' };
