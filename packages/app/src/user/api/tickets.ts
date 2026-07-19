@@ -5,10 +5,7 @@ import type {
   TicketSummary,
   TicketPriority,
   TicketAttachment,
-} from '@/types/ticket';
-import { MOCK_TICKETS, getMockTicketDetail } from '@/lib/mockData';
-
-const USE_MOCK = import.meta.env.VITE_USE_MOCK === 'true' || import.meta.env.DEV;
+} from '@/user/types/ticket';
 
 async function apiFetch<T>(path: string): Promise<T> {
   const res = await fetch(`/api${path}`);
@@ -25,54 +22,18 @@ export interface TicketFilters {
 }
 
 export async function fetchTickets(filters: TicketFilters = {}): Promise<TicketsListResponse> {
-  if (USE_MOCK) {
-    let tickets = [...MOCK_TICKETS];
-    if (filters.status && filters.status !== 'all') {
-      tickets = tickets.filter((t) => {
-        if (filters.status === 'open') return t.status === 'open';
-        if (filters.status === 'in_progress') return ['kb_lookup', 'l1', 'l2'].includes(t.status);
-        if (filters.status === 'resolved') return t.status === 'resolved';
-        return true;
-      });
-    }
-    if (filters.priority && filters.priority !== 'all') {
-      tickets = tickets.filter((t) => t.priority === filters.priority);
-    }
-    if (filters.search) {
-      const q = filters.search.toLowerCase();
-      tickets = tickets.filter(
-        (t) => t.title.toLowerCase().includes(q) || t.id.toLowerCase().includes(q),
-      );
-    }
-    return { tickets, total: tickets.length };
-  }
   const params = new URLSearchParams();
-  if (filters.status) params.set('status', filters.status);
-  if (filters.priority) params.set('priority', filters.priority);
+  if (filters.status && filters.status !== 'all') params.set('status', filters.status);
+  if (filters.priority && filters.priority !== 'all') params.set('priority', filters.priority);
   if (filters.search) params.set('search', filters.search);
   return apiFetch<TicketsListResponse>(`/tickets?${params.toString()}`);
 }
 
 export async function fetchTicketDetail(id: string): Promise<TicketDetailResponse> {
-  if (USE_MOCK) {
-    const detail = getMockTicketDetail(id);
-    if (!detail) throw new Error(`Ticket ${id} not found`);
-    return detail;
-  }
   return apiFetch<TicketDetailResponse>(`/tickets/${id}`);
 }
 
 export async function postComment(ticketId: string, content: string): Promise<TicketComment> {
-  if (USE_MOCK) {
-    return {
-      id: crypto.randomUUID(),
-      ticket_id: ticketId,
-      author: 'You',
-      author_type: 'human',
-      content,
-      created_at: new Date().toISOString(),
-    };
-  }
   const res = await fetch(`/api/tickets/${ticketId}/comments`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -90,24 +51,6 @@ export interface CreateTicketInput {
 }
 
 export async function createTicket(input: CreateTicketInput): Promise<TicketSummary> {
-  if (USE_MOCK) {
-    const maxId = Math.max(...MOCK_TICKETS.map((t) => parseInt(t.id.split('-')[1] ?? '0', 10)));
-    const newId = `TKT-${String(maxId + 1).padStart(4, '0')}`;
-    const now = new Date().toISOString();
-    const ticket: TicketSummary = {
-      id: newId,
-      title: input.title,
-      status: 'open',
-      priority: input.priority ?? 'P3',
-      raised_by: input.raised_by ?? 'You',
-      assigned_agent: 'unassigned',
-      current_owner: 'unassigned',
-      created_at: now,
-      updated_at: now,
-    };
-    MOCK_TICKETS.unshift(ticket);
-    return ticket;
-  }
   const res = await fetch('/api/tickets', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -130,17 +73,6 @@ function readFileAsBase64(file: File): Promise<string> {
 }
 
 export async function uploadAttachments(ticketId: string, files: File[]): Promise<TicketAttachment[]> {
-  if (USE_MOCK) {
-    return files.map((f) => ({
-      id: crypto.randomUUID(),
-      ticket_id: ticketId,
-      filename: f.name,
-      content_type: f.type,
-      size: f.size,
-      url: URL.createObjectURL(f),
-      uploaded_at: new Date().toISOString(),
-    }));
-  }
   const results: TicketAttachment[] = [];
   for (const file of files) {
     const data = await readFileAsBase64(file);

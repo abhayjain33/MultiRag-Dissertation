@@ -50,6 +50,7 @@ export class OllamaAdapter implements LLMProvider {
       model: this.model,
       messages: ollamaMessages,
       stream: true,
+      think: false,
       options: {
         temperature: options?.temperature ?? this.defaultTemperature,
         num_predict: options?.max_tokens ?? this.defaultMaxTokens,
@@ -135,6 +136,12 @@ export class OllamaAdapter implements LLMProvider {
     for (const m of messages) {
       if (m.role === 'system') {
         result.push({ role: 'system', content: m.content });
+      } else if (m.role === 'assistant' && m.tool_calls?.length) {
+        result.push({
+          role: 'assistant',
+          content: m.content ?? '',
+          tool_calls: m.tool_calls.map(tc => ({ function: { name: tc.name, arguments: tc.arguments } })),
+        });
       } else if (m.role === 'tool' && m.tool_results) {
         result.push({ role: 'tool', content: m.tool_results[0]?.content ?? '' });
       } else {

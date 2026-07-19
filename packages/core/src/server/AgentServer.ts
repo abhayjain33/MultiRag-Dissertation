@@ -1,8 +1,27 @@
 import { createServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
+import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { join, basename, extname } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { WebSocketServer, WebSocket } from 'ws';
-import type { Store } from '../store/Store.js';
+import type { Store, AttachmentMeta } from '../store/Store.js';
 import type { AgentWSEvent, AgentChainNode, AgentChainHandoff, Ticket } from '../types.js';
+
+// ── MIME helper ───────────────────────────────────────────────────────────────
+
+const MIME: Record<string, string> = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.svg': 'image/svg+xml',
+  '.pdf': 'application/pdf',
+};
+
+function mimeFromExt(ext: string): string {
+  return MIME[ext] ?? 'application/octet-stream';
+}
 
 // ── Tiny HTTP router ───────────────────────────────────────────────────────────
 
@@ -106,6 +125,7 @@ export class AgentServer {
     private agentId: string,
     private agentName: string,
     private startTime: Date,
+    private dataDir: string,
   ) {
     this.httpServer = createServer(async (req, res) => {
       // CORS preflight
@@ -192,8 +212,8 @@ export class AgentServer {
       const status = url.searchParams.get('status');
       const priority = url.searchParams.get('priority');
       let tickets = this.store.listTickets();
-      if (status) tickets = tickets.filter(t => t.status === status);
-      if (priority) tickets = tickets.filter(t => t.priority === priority);
+      if (status && status !== 'all') tickets = tickets.filter(t => t.status === status);
+      if (priority && priority !== 'all') tickets = tickets.filter(t => t.priority === priority);
       const currentOwner = this.agentId;
       json(res, 200, { tickets: tickets.map(t => toSummary(t, currentOwner)), total: tickets.length });
     });
@@ -212,11 +232,31 @@ export class AgentServer {
       });
     });
 
-    // Create ticket (POST /api/tickets) — body forwarded to AgentManager via callback
+    // Create ticket (POST /api/tickets) — respond immediately, process async
     R('POST', '/api/tickets', async (_req, res, _params, body) => {
       const b = (body ?? {}) as Record<string, unknown>;
-      json(res, 202, { received: true, message: 'Ticket queued for processing', input: b });
-      this.onCreateTicket?.(b);
+      // Pre-assign ID so the caller can navigate/subscribe before processing starts
+      const ticketId = b['id'] !== undefined ? String(b['id']) : `TKT-${Date.now()}`;
+      b['id'] = ticketId;
+      json(res, 202, { id: ticketId, ticket_id: ticketId, received: true, message: 'Ticket queued for processing' });
+      void this.onCreateTicket?.(b);
+    });
+
+    // Relay chain events from peer agents (for multi-agent chain visualisation)
+    R('POST', '/api/tickets/:id/chain-relay', async (_req, res, params, body) => {
+      const ticketId = params['id'] ?? '';
+      if (!this.store.getTicket(ticketId)) { json(res, 404, { error: 'Ticket not found' }); return; }
+      const b = (body ?? {}) as { kind?: string; node?: AgentChainNode; handoff?: AgentChainHandoff };
+      if (b.kind === 'node' && b.node) {
+        const node = { ...b.node, ticket_id: ticketId };
+        this.store.addChainNode(ticketId, node);
+        this.broadcast({ type: 'ticket.chain_updated', ticket_id: ticketId, agent_id: node.participant_id, payload: { kind: 'node', node }, timestamp: node.timestamp });
+      } else if (b.kind === 'handoff' && b.handoff) {
+        const handoff = { ...b.handoff, ticket_id: ticketId };
+        this.store.addChainHandoff(ticketId, handoff);
+        this.broadcast({ type: 'ticket.chain_updated', ticket_id: ticketId, agent_id: handoff.from_participant, payload: { kind: 'handoff', handoff }, timestamp: handoff.timestamp });
+      }
+      json(res, 204, {});
     });
 
     // Post message to ticket
@@ -236,10 +276,66 @@ export class AgentServer {
       json(res, 202, { received: true, skill_id: skillId });
       this.onRunSkill?.(skillId, inputs);
     });
+
+    // Upload attachment (base64 JSON body: { filename, content_type, data })
+    R('POST', '/api/tickets/:id/attachments', async (_req, res, params, body) => {
+      const ticketId = params['id'] ?? '';
+      if (!this.store.getTicket(ticketId)) { json(res, 404, { error: 'Ticket not found' }); return; }
+      const b = (body ?? {}) as Record<string, unknown>;
+      const rawName = basename(String(b['filename'] ?? 'upload'));
+      const safeExt = extname(rawName).toLowerCase().replace(/[^.a-z0-9]/g, '');
+      const safeBase = rawName.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 120);
+      const filename = `${Date.now()}_${safeBase}`;
+      const dir = join(this.dataDir, 'attachments', ticketId);
+      await mkdir(dir, { recursive: true });
+      const buf = Buffer.from(String(b['data'] ?? ''), 'base64');
+      await writeFile(join(dir, filename), buf);
+      const meta: AttachmentMeta = {
+        id: randomUUID(),
+        ticket_id: ticketId,
+        filename,
+        content_type: String(b['content_type'] ?? mimeFromExt(safeExt)),
+        size: buf.length,
+        uploaded_at: new Date().toISOString(),
+      };
+      this.store.addAttachment(meta);
+      json(res, 201, {
+        ...meta,
+        url: `/api/attachments/${ticketId}/${filename}`,
+      });
+    });
+
+    // Serve attachment file
+    R('GET', '/api/attachments/:ticket_id/:filename', async (_req, res, params) => {
+      const ticketId = params['ticket_id'] ?? '';
+      const filename = basename(params['filename'] ?? '');
+      const filePath = join(this.dataDir, 'attachments', ticketId, filename);
+      let buf: Buffer;
+      try { buf = await readFile(filePath); }
+      catch { json(res, 404, { error: 'Attachment not found' }); return; }
+      const ext = extname(filename).toLowerCase().replace(/[^.a-z0-9]/g, '');
+      res.writeHead(200, {
+        'Content-Type': mimeFromExt(ext),
+        'Content-Length': buf.length,
+        'Cache-Control': 'public, max-age=31536000',
+        'Access-Control-Allow-Origin': '*',
+      });
+      res.end(buf);
+    });
+
+    // List attachments for a ticket
+    R('GET', '/api/tickets/:id/attachments', async (_req, res, params) => {
+      const ticketId = params['id'] ?? '';
+      const list = this.store.getAttachments(ticketId).map((m) => ({
+        ...m,
+        url: `/api/attachments/${ticketId}/${m.filename}`,
+      }));
+      json(res, 200, { attachments: list });
+    });
   }
 
   // Callbacks set by AgentManager
-  onCreateTicket: ((input: Record<string, unknown>) => void) | undefined;
+  onCreateTicket: ((input: Record<string, unknown>) => Promise<{ id: string }>) | undefined;
   onMessage: ((ticketId: string, content: string, author: string) => void) | undefined;
   onRunSkill: ((skillId: string, inputs: Record<string, unknown>) => void) | undefined;
 }

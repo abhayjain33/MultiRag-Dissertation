@@ -864,6 +864,29 @@ llm:
   ollama_base_url: http://localhost:11434
 ```
 
+### Free API providers (OpenAI-compatible)
+
+Any OpenAI-compatible endpoint works via `provider: openai` + `base_url` (Groq, Gemini,
+Cerebras, OpenRouter…). Since some free chat providers (e.g. Groq) have no embeddings API,
+an optional top-level `embedding:` block delegates RAG embeddings to a second provider:
+
+```yaml
+llm:                                # chat → Groq (free)
+  provider: openai
+  model: llama-3.3-70b-versatile
+  base_url: https://api.groq.com/openai/v1
+  api_key: ${GROQ_API_KEY}
+
+embedding:                          # embeddings → Gemini (free); optional
+  provider: openai
+  model: gemini-embedding-001
+  base_url: https://generativelanguage.googleapis.com/v1beta/openai/
+  api_key: ${GEMINI_API_KEY}
+  embedding_model: gemini-embedding-001
+```
+
+If `embedding:` is omitted, the `llm:` provider is used for both chat and embeddings.
+
 ---
 
 ## Development

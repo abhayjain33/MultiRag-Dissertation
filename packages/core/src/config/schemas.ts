@@ -92,6 +92,9 @@ export const LLMConfigSchema = z.object({
   temperature: z.number().min(0).max(2).default(0.2),
   max_tokens: z.number().int().positive().default(4096),
   system_prompt: z.string().optional(),
+  // OpenAI-compatible providers (OpenAI, Groq, Gemini, Cerebras, OpenRouter, …)
+  base_url: z.string().url().optional(),
+  embedding_model: z.string().optional(),
   // Azure-specific
   azure_endpoint: envOrLiteral.optional(),
   azure_deployment: z.string().optional(),
@@ -113,7 +116,9 @@ const RoutingConfigSchema = z.object({
   escalate_to: z.string().optional(),
   escalate_after_minutes: z.number().int().positive().optional(),
   escalate_on_skill: z.string().optional(),
+  resolve_on_skill: z.string().optional(),
   accepts_from: z.array(z.string()).default([]),
+  peer_agents: z.record(z.string(), z.string()).default({}),
   ticket_system: TicketSystemSchema.optional(),
 });
 
@@ -131,6 +136,10 @@ export const AgentConfigSchema = z.object({
     icon: z.string().optional(),
   }),
   llm: LLMConfigSchema,
+  // Optional separate provider for embeddings (RAG). If omitted, `llm` is used for
+  // both chat and embeddings. Useful when the chat provider (e.g. Groq) has no
+  // embeddings API — point this at Gemini/OpenAI while chat runs elsewhere.
+  embedding: LLMConfigSchema.optional(),
   knowledge: z
     .object({
       embedding_model: z.string().default('text-embedding-3-small'),

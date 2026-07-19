@@ -2,14 +2,14 @@
   "name": "agent-platform",
   "version": "1.0.0",
   "private": true,
-  "description": "Config-file-driven, composable AI Agent Platform — M.Tech AIML Dissertation, BITS Pilani WILP",
+  "description": "Agentic Triage Platform — Config-file-driven, composable AI Agent Platform — M.Tech AIML Dissertation, BITS Pilani WILP",
   "engines": {
     "node": ">=20.0.0",
     "pnpm": ">=8.0.0"
   },
   "scripts": {
     "build": "pnpm -r build",
-    "dev": "pnpm -r --parallel dev",
+    "dev": "pnpm --filter @agent-platform/app --filter @agent-platform/core --filter @agent-platform/cli --parallel dev",
     "test": "pnpm -r test",
     "lint": "pnpm -r lint",
     "format": "prettier --write \"**/*.{ts,tsx,json,yaml,md}\"",

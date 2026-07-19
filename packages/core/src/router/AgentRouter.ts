@@ -6,16 +6,23 @@ type EscalateTrigger = 'timeout' | 'skill_output' | 'manual';
 export class AgentRouter {
   constructor(private config: AgentConfig) {}
 
-  evaluate(ticket: Ticket, trigger: EscalateTrigger, skillOutput?: Record<string, unknown>): RoutingDecision {
+  evaluate(ticket: Ticket, trigger: EscalateTrigger, skillOutput?: Record<string, unknown>, skillId?: string): RoutingDecision {
     const routing = this.config.routing;
     if (!routing) return { action: 'handle', reason: 'No routing configured' };
 
-    if (trigger === 'skill_output' && routing.escalate_on_skill && skillOutput) {
-      const decision = String(skillOutput['decision'] ?? '').toUpperCase();
-      if (decision === 'ESCALATE' || JSON.stringify(skillOutput).toUpperCase().includes('"ESCALATE"')) {
-        const target = routing.escalate_to;
-        if (target) return { action: 'escalate', target_agent: target, reason: 'Skill flagged escalation' };
-        return { action: 'escalate', reason: 'Skill flagged escalation' };
+    if (trigger === 'skill_output' && skillOutput) {
+      // If this is the designated escalation skill, always escalate on completion
+      if (routing.escalate_on_skill && skillId === routing.escalate_on_skill && routing.escalate_to) {
+        return { action: 'escalate', target_agent: routing.escalate_to, reason: `${skillId} complete — escalating to ${routing.escalate_to}` };
+      }
+      // Legacy: escalate if the LLM output explicitly says ESCALATE
+      if (routing.escalate_on_skill) {
+        const decision = String(skillOutput['decision'] ?? '').toUpperCase();
+        if (decision === 'ESCALATE' || JSON.stringify(skillOutput).toUpperCase().includes('"ESCALATE"')) {
+          const target = routing.escalate_to;
+          if (target) return { action: 'escalate', target_agent: target, reason: 'Skill flagged escalation' };
+          return { action: 'escalate', reason: 'Skill flagged escalation' };
+        }
       }
     }
 

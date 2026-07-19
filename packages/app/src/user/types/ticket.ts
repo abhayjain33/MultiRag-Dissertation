@@ -37,6 +37,7 @@ export type TicketEventType =
   | 'ticket.status_changed'
   | 'ticket.escalated'
   | 'ticket.resolved'
+  | 'ticket.chain_updated'
   | 'agent.kb_lookup_complete'
   | 'agent.skill_complete'
   | 'agent.thinking'

@@ -16,6 +16,8 @@ export class MCPClient {
 
   constructor(private config: MCPConfig) {}
 
+  get id(): string { return this.config.id; }
+
   async connect(): Promise<void> {
     this.baseUrl = resolveEnvVar(this.config.url);
     const token = this.config.auth_token ? resolveEnvVar(this.config.auth_token) : undefined;
@@ -23,14 +25,19 @@ export class MCPClient {
     if (this.config.auth_type === 'basic' && token) this.authHeader = `Basic ${Buffer.from(token).toString('base64')}`;
 
     const headers = this.buildHeaders();
+    headers['Content-Type'] = 'application/json';
     let defs: MCPToolDef[] = [];
     try {
-      const res = await fetch(`${this.baseUrl}/tools/list`, { headers });
+      const res = await fetch(`${this.baseUrl}/messages`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
+      });
       if (res.ok) {
-        const data = await res.json() as { tools?: MCPToolDef[] };
-        defs = data.tools ?? [];
+        const data = await res.json() as { result?: { tools?: MCPToolDef[] } };
+        defs = data.result?.tools ?? [];
       } else {
-        console.warn(`[MCP:${this.config.id}] /tools/list returned ${res.status}`);
+        console.warn(`[MCP:${this.config.id}] /messages tools/list returned ${res.status}`);
       }
     } catch (e) {
       console.warn(`[MCP:${this.config.id}] Connection failed: ${String(e)}`);
@@ -58,14 +65,15 @@ export class MCPClient {
     const headers = this.buildHeaders();
     headers['Content-Type'] = 'application/json';
     try {
-      const res = await fetch(`${this.baseUrl}/tools/call`, {
+      const res = await fetch(`${this.baseUrl}/messages`, {
         method: 'POST',
         headers,
-        body: JSON.stringify({ name: rawName, arguments: args }),
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: rawName, arguments: args } }),
       });
-      const data = await res.json() as { content?: string; error?: string };
-      if (!res.ok) return { tool_call_id: qualifiedName, content: data.error ?? 'Tool error', is_error: true };
-      return { tool_call_id: qualifiedName, content: data.content ?? JSON.stringify(data) };
+      const data = await res.json() as { result?: { content?: Array<{ type: string; text: string }> }; error?: { message: string } };
+      if (!res.ok || data.error) return { tool_call_id: qualifiedName, content: data.error?.message ?? 'Tool error', is_error: true };
+      const text = data.result?.content?.[0]?.text ?? JSON.stringify(data.result);
+      return { tool_call_id: qualifiedName, content: text };
     } catch (e) {
       return { tool_call_id: qualifiedName, content: String(e), is_error: true };
     }

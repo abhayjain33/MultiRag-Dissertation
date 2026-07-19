@@ -2,8 +2,10 @@ import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import type { LLMProvider } from '../llm/LLMProvider.js';
 import type { RAGPipeline } from '../rag/RAGPipeline.js';
-import type { Tool, SkillResult, RAGContext, Message } from '../types.js';
+import type { Tool, ToolCall, ToolResult, SkillResult, RAGContext, Message } from '../types.js';
 import type { SkillConfig } from '../config/schemas.js';
+
+const MAX_TOOL_ROUNDS = 8;
 
 export class SkillExecutor {
   constructor(
@@ -12,6 +14,7 @@ export class SkillExecutor {
     private rag: RAGPipeline,
     private tools: Tool[] = [],
     private configDir: string = process.cwd(),
+    private callTool?: (name: string, args: Record<string, unknown>) => Promise<ToolResult>,
   ) {}
 
   async execute(inputs: Record<string, unknown>): Promise<SkillResult> {
@@ -43,15 +46,39 @@ export class SkillExecutor {
     }
     messages.push({ role: 'user', content: userPrompt });
 
-    // Stream LLM response
+    // Agentic tool-call loop
+    const llmOpts = { temperature: 0.1, max_tokens: this.skill.output.format === 'structured' ? 4096 : 2048 };
+    const activeTools = this.tools.length > 0 ? this.tools : undefined;
     let fullText = '';
+    let totalToolCallsMade = 0;
     try {
-      for await (const chunk of this.llm.chat(
-        messages,
-        this.tools.length > 0 ? this.tools : undefined,
-        { temperature: 0.1, max_tokens: this.skill.output.format === 'structured' ? 4096 : 2048 },
-      )) {
-        if (chunk.type === 'text' && chunk.text) fullText += chunk.text;
+      for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+        const roundCalls: ToolCall[] = [];
+        let roundText = '';
+        for await (const chunk of this.llm.chat(messages, activeTools, llmOpts)) {
+          if (chunk.type === 'text' && chunk.text) roundText += chunk.text;
+          if (chunk.type === 'tool_call' && chunk.tool_call) roundCalls.push(chunk.tool_call);
+        }
+        if (roundCalls.length === 0) {
+          // If tools were available but none called on first round, nudge the LLM to use them
+          if (this.callTool && activeTools && round === 0 && totalToolCallsMade === 0) {
+            messages.push({ role: 'assistant', content: roundText });
+            messages.push({ role: 'user', content: 'You must call the available tools to gather real data before providing your answer. Call each tool now with the correct arguments from the incident.' });
+            continue;
+          }
+          fullText = roundText;
+          break;
+        }
+        // Add assistant turn with tool calls
+        messages.push({ role: 'assistant', content: roundText, tool_calls: roundCalls });
+        // Execute each tool and feed results back
+        for (const tc of roundCalls) {
+          console.log(`[SkillExecutor] Calling tool: ${tc.name}`, JSON.stringify(tc.arguments));
+          const result = await this.callTool!(tc.name, tc.arguments);
+          console.log(`[SkillExecutor] Tool result (${tc.name}): ${result.content.slice(0, 300)}`);
+          messages.push({ role: 'tool', content: result.content, tool_results: [result] });
+          totalToolCallsMade++;
+        }
       }
     } catch (e) { return this.failure(`LLM error: ${String(e)}`, t0, ragCtx); }
 
@@ -89,7 +116,8 @@ export class SkillExecutor {
 }
 
 function renderTemplate(template: string, inputs: Record<string, unknown>): string {
-  return template.replace(/\{\{(\w+)\}\}/g, (_, key: string) =>
+  // Flatten dot-notation keys so {{ticket.chain_context}} resolves from inputs['ticket.chain_context']
+  return template.replace(/\{\{([\w.]+)\}\}/g, (_, key: string) =>
     key in inputs ? String(inputs[key]) : `{{${key}}}`,
   );
 }

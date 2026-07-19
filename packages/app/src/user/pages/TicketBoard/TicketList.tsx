@@ -4,12 +4,12 @@ import { Link, useNavigate } from 'react-router-dom';
 import {
   Search, Download, ExternalLink, ArrowUpDown, RefreshCw, Plus, X, Paperclip,
 } from 'lucide-react';
-import type { TicketFilters, CreateTicketInput } from '@/api/tickets';
-import { fetchTickets, exportTicketsCSV, createTicket, uploadAttachments } from '@/api/tickets';
-import type { TicketSummary, TicketPriority } from '@/types/ticket';
-import { StatusBadge, PriorityBadge } from '@/components/ui/badge';
-import { Button } from '@/components/ui/button';
-import { Input, Select } from '@/components/ui/input';
+import type { TicketFilters, CreateTicketInput } from '@/user/api/tickets';
+import { fetchTickets, exportTicketsCSV, createTicket, uploadAttachments } from '@/user/api/tickets';
+import type { TicketSummary, TicketPriority } from '@/user/types/ticket';
+import { StatusBadge, PriorityBadge } from '@/user/components/ui/badge';
+import { Button } from '@/user/components/ui/button';
+import { Input, Select } from '@/user/components/ui/input';
 import { formatRelativeTime, cn } from '@/lib/utils';
 
 export function TicketList() {
@@ -197,7 +197,7 @@ export function TicketList() {
           onCreated={(ticket) => {
             setShowCreate(false);
             void refetch();
-            void navigate(`/tickets/${ticket.id}`);
+            void navigate(`/user/tickets/${ticket.id}`);
           }}
         />
       )}
@@ -446,7 +446,7 @@ function TicketRow({
       </td>
       <td className="px-3 py-3 max-w-xs">
         <Link
-          to={`/tickets/${ticket.id}`}
+          to={`/user/tickets/${ticket.id}`}
           className="font-medium text-gray-900 hover:text-indigo-600 line-clamp-1"
         >
           {ticket.title}
@@ -468,7 +468,7 @@ function TicketRow({
       </td>
       <td className="px-3 py-3">
         <Link
-          to={`/tickets/${ticket.id}`}
+          to={`/user/tickets/${ticket.id}`}
           className="opacity-0 group-hover:opacity-100 text-gray-400 hover:text-indigo-600 transition-opacity"
           title="Open ticket"
         >

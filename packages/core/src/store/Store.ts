@@ -2,6 +2,15 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import type { Ticket, RoutingEvent, AgentChainNode, AgentChainHandoff, TicketPriority } from '../types.js';
 
+export interface AttachmentMeta {
+  id: string;
+  ticket_id: string;
+  filename: string;
+  content_type: string;
+  size: number;
+  uploaded_at: string;
+}
+
 export interface StoreComment {
   id: string;
   ticket_id: string;
@@ -26,6 +35,7 @@ interface PersistedData {
   routing_events: RoutingEvent[];
   chain_nodes: Record<string, AgentChainNode[]>;
   chain_handoffs: Record<string, AgentChainHandoff[]>;
+  attachments: Record<string, AttachmentMeta[]>;
 }
 
 export class Store {
@@ -34,7 +44,9 @@ export class Store {
   private routingEvents: RoutingEvent[] = [];
   private chainNodes = new Map<string, AgentChainNode[]>();
   private chainHandoffs = new Map<string, AgentChainHandoff[]>();
+  private attachments = new Map<string, AttachmentMeta[]>();
   private sessions = new Map<string, Session>();
+  private writeQueue: Promise<void> = Promise.resolve();
 
   constructor(private persistPath?: string | undefined) {}
 
@@ -65,9 +77,16 @@ export class Store {
     this.routingEvents = data.routing_events ?? [];
     for (const [id, ns] of Object.entries(data.chain_nodes ?? {})) this.chainNodes.set(id, ns);
     for (const [id, hs] of Object.entries(data.chain_handoffs ?? {})) this.chainHandoffs.set(id, hs);
+    for (const [id, as_] of Object.entries(data.attachments ?? {})) this.attachments.set(id, as_);
   }
 
-  async persist(): Promise<void> {
+  persist(): void {
+    if (!this.persistPath) return;
+    // Serialize writes — queue the next write behind the in-flight one
+    this.writeQueue = this.writeQueue.then(() => this.doWrite()).catch(() => this.doWrite());
+  }
+
+  private async doWrite(): Promise<void> {
     if (!this.persistPath) return;
     const data: PersistedData = {
       tickets: Object.fromEntries(this.tickets),
@@ -75,6 +94,7 @@ export class Store {
       routing_events: this.routingEvents,
       chain_nodes: Object.fromEntries(this.chainNodes),
       chain_handoffs: Object.fromEntries(this.chainHandoffs),
+      attachments: Object.fromEntries(this.attachments),
     };
     await mkdir(dirname(this.persistPath), { recursive: true });
     await writeFile(this.persistPath, JSON.stringify(data, null, 2));
@@ -85,7 +105,7 @@ export class Store {
   createTicket(ticket: Omit<Ticket, 'created_at'>): Ticket {
     const t: Ticket = { ...ticket, created_at: new Date() };
     this.tickets.set(t.id, t);
-    void this.persist();
+    this.persist();
     return t;
   }
 
@@ -100,7 +120,7 @@ export class Store {
     if (!t) return undefined;
     const updated: Ticket = { ...t, ...patch, updated_at: new Date() };
     this.tickets.set(id, updated);
-    void this.persist();
+    this.persist();
     return updated;
   }
 
@@ -110,10 +130,21 @@ export class Store {
     const list = this.comments.get(c.ticket_id) ?? [];
     list.push(c);
     this.comments.set(c.ticket_id, list);
-    void this.persist();
+    this.persist();
   }
 
   getComments(ticketId: string): StoreComment[] { return this.comments.get(ticketId) ?? []; }
+
+  // ── Attachments ────────────────────────────────────────────────────────────
+
+  addAttachment(meta: AttachmentMeta): void {
+    const list = this.attachments.get(meta.ticket_id) ?? [];
+    list.push(meta);
+    this.attachments.set(meta.ticket_id, list);
+    this.persist();
+  }
+
+  getAttachments(ticketId: string): AttachmentMeta[] { return this.attachments.get(ticketId) ?? []; }
 
   // ── Chain ──────────────────────────────────────────────────────────────────
 
@@ -123,14 +154,14 @@ export class Store {
     const updated = existing.map(n => ({ ...n, is_current: false }));
     updated.push(node);
     this.chainNodes.set(ticketId, updated);
-    void this.persist();
+    this.persist();
   }
 
   addChainHandoff(ticketId: string, handoff: AgentChainHandoff): void {
     const list = this.chainHandoffs.get(ticketId) ?? [];
     list.push(handoff);
     this.chainHandoffs.set(ticketId, list);
-    void this.persist();
+    this.persist();
   }
 
   getChainNodes(ticketId: string): AgentChainNode[] { return this.chainNodes.get(ticketId) ?? []; }
@@ -140,7 +171,7 @@ export class Store {
 
   addRoutingEvent(e: RoutingEvent): void {
     this.routingEvents.push(e);
-    void this.persist();
+    this.persist();
   }
 
   getRoutingEvents(ticketId: string): RoutingEvent[] {

@@ -24,6 +24,7 @@ function now(): string { return new Date().toISOString(); }
 export class AgentManager extends EventEmitter {
   private config!: AgentConfig;
   private llm!: LLMProvider;
+  private embedder!: LLMProvider;
   private rag!: RAGPipeline;
   private store!: Store;
   private router!: AgentRouter;
@@ -48,20 +49,25 @@ export class AgentManager extends EventEmitter {
 
     console.log(`[AgentManager] Starting agent: ${this.config.agent.display_name}`);
 
-    // 2. LLM provider
+    // 2. LLM provider (chat) + embedding provider (RAG).
+    // If `embedding` is configured, use a dedicated provider for embeddings;
+    // otherwise reuse the chat provider for both.
     this.llm = createLLMProvider(this.config.llm);
+    this.embedder = this.config.embedding
+      ? createLLMProvider(this.config.embedding)
+      : this.llm;
 
     // 3. Knowledge sources + RAG
-    this.rag = new RAGPipeline(this.llm);
+    this.rag = new RAGPipeline(this.embedder);
     for (const src of this.config.knowledge?.sources ?? []) {
       if (src.type === 'markdown') {
-        const p = new MarkdownProcessor(src, this.llm);
+        const p = new MarkdownProcessor(src, this.embedder);
         await p.index();
         await p.startWatching();
         this.rag.addMarkdown(p);
         this.processors.push(p);
       } else if (src.type === 'folder') {
-        const p = new FolderProcessor(src, this.llm);
+        const p = new FolderProcessor(src, this.embedder);
         await p.index();
         await p.startWatching();
         this.rag.addFolder(p);
@@ -85,9 +91,10 @@ export class AgentManager extends EventEmitter {
     }
 
     // 5. Store
-    const storePath = this.config.knowledge?.vector_store_path
-      ? resolve(this.configDir, this.config.knowledge.vector_store_path, 'store.json')
-      : resolve(this.configDir, 'data', 'store.json');
+    const dataDir = this.config.knowledge?.vector_store_path
+      ? resolve(this.configDir, this.config.knowledge.vector_store_path)
+      : resolve(this.configDir, 'data');
+    const storePath = resolve(dataDir, 'store.json');
     this.store = new Store(storePath);
     await this.store.load();
 
@@ -95,15 +102,20 @@ export class AgentManager extends EventEmitter {
     this.router = new AgentRouter(this.config);
 
     // 7. Skill executors
+    const callTool = async (name: string, args: Record<string, unknown>) => {
+      const client = this.mcpClients.find(c => name.startsWith(`${c.id}__`));
+      if (!client) return { tool_call_id: name, content: `No MCP client for tool: ${name}`, is_error: true };
+      return client.callTool(name, args);
+    };
     for (const skill of this.config.skills) {
-      const executor = new SkillExecutor(skill, this.llm, this.rag, mcpTools, this.configDir);
+      const executor = new SkillExecutor(skill, this.llm, this.rag, mcpTools, this.configDir, callTool);
       this.executors.set(skill.id, executor);
     }
 
     // 8. HTTP + WebSocket server
     const port = this.config.interface?.api_port ?? 8001;
-    this.server = new AgentServer(this.store, this.config.agent.name, this.config.agent.display_name, this.startTime);
-    this.server.onCreateTicket = (input) => void this.handleTicketInput(input);
+    this.server = new AgentServer(this.store, this.config.agent.name, this.config.agent.display_name, this.startTime, dataDir);
+    this.server.onCreateTicket = async (input) => { const t = await this.handleTicketInput(input); return { id: t.id }; };
     this.server.onMessage = (ticketId, content, author) => void this.handleMessage(ticketId, content, author);
     this.server.onRunSkill = (skillId, inputs) => void this.handleExplicitSkill(skillId, inputs);
     await this.server.listen(port);
@@ -122,6 +134,7 @@ export class AgentManager extends EventEmitter {
   // ── Ticket handling ──────────────────────────────────────────────────────────
 
   async createTicket(input: {
+    id?: string | undefined;
     title: string;
     description?: string | undefined;
     priority?: Ticket['priority'] | undefined;
@@ -129,7 +142,7 @@ export class AgentManager extends EventEmitter {
     metadata?: Record<string, unknown> | undefined;
   }): Promise<Ticket> {
     const ticket = this.store.createTicket({
-      id: `TKT-${Date.now()}`,
+      id: input.id ?? `TKT-${Date.now()}`,
       title: input.title,
       status: 'open',
       assigned_agent: this.config.agent.name,
@@ -139,31 +152,32 @@ export class AgentManager extends EventEmitter {
       ...(input.metadata !== undefined ? { metadata: input.metadata } : {}),
     });
 
-    // Raiser node
-    const raiserId = `raiser-${ticket.id}`;
-    this.store.addChainNode(ticket.id, this.makeNode({
-      id: uid('node'),
-      ticket_id: ticket.id,
-      participant_id: raiserId,
-      participant_label: ticket.raised_by ?? 'User',
-      participant_type: 'raiser',
-      node_type: 'ticket_raised',
-      summary: ticket.title,
-      payload: { description: ticket.description ?? '' },
-      is_current: false,
-    }));
-
-    // Handoff from raiser to this agent
-    this.store.addChainHandoff(ticket.id, {
-      id: uid('ho'),
-      ticket_id: ticket.id,
-      from_participant: raiserId,
-      from_label: ticket.raised_by ?? 'User',
-      to_participant: this.config.agent.name,
-      to_label: this.config.agent.display_name,
-      timestamp: now(),
-      label: 'Assigned to',
-    });
+    // Only add raiser node + initial handoff when this is the originating agent (no relay_to means we ARE the coordinator)
+    const isOriginator = !ticket.metadata?.['relay_to'];
+    if (isOriginator) {
+      const raiserId = `raiser-${ticket.id}`;
+      this.store.addChainNode(ticket.id, this.makeNode({
+        id: uid('node'),
+        ticket_id: ticket.id,
+        participant_id: raiserId,
+        participant_label: ticket.raised_by ?? 'User',
+        participant_type: 'raiser',
+        node_type: 'ticket_raised',
+        summary: ticket.title,
+        payload: { description: ticket.description ?? '' },
+        is_current: false,
+      }));
+      this.store.addChainHandoff(ticket.id, {
+        id: uid('ho'),
+        ticket_id: ticket.id,
+        from_participant: raiserId,
+        from_label: ticket.raised_by ?? 'User',
+        to_participant: this.config.agent.name,
+        to_label: this.config.agent.display_name,
+        timestamp: now(),
+        label: 'Assigned to',
+      });
+    }
 
     this.emit('ticket.created', ticket);
     this.sendWS({ type: 'ticket.created', ticket_id: ticket.id, agent_id: this.config.agent.name, payload: { title: ticket.title, status: ticket.status, priority: ticket.priority ?? 'P3', raised_by: ticket.raised_by ?? 'User' }, timestamp: now() });
@@ -204,12 +218,18 @@ export class AgentManager extends EventEmitter {
 
   // ── Internal helpers ─────────────────────────────────────────────────────────
 
-  private async handleTicketInput(input: Record<string, unknown>): Promise<void> {
-    await this.createTicket({
+  private async handleTicketInput(input: Record<string, unknown>): Promise<Ticket> {
+    const relayTo = input['relay_to'] !== undefined ? String(input['relay_to']) : undefined;
+    return this.createTicket({
+      id: input['id'] !== undefined ? String(input['id']) : undefined,
       title: String(input['title'] ?? 'Untitled ticket'),
       description: input['description'] !== undefined ? String(input['description']) : undefined,
       priority: input['priority'] as Ticket['priority'] | undefined,
       raised_by: input['raised_by'] !== undefined ? String(input['raised_by']) : undefined,
+      metadata: {
+        ...(input['metadata'] as Record<string, unknown> | undefined ?? {}),
+        ...(relayTo ? { relay_to: relayTo } : {}),
+      },
     });
   }
 
@@ -222,10 +242,15 @@ export class AgentManager extends EventEmitter {
     for (const skill of triggered) {
       const executor = this.executors.get(skill.id);
       if (!executor) continue;
+      const chainContext = ticket.metadata?.['chain_context'] as string | undefined ?? '';
       const inputs: Record<string, unknown> = {
         ticket_id: ticket.id,
         title: ticket.title,
         description: ticket.description ?? '',
+        'ticket.title': ticket.title,
+        'ticket.description': ticket.description ?? '',
+        'ticket.chain_context': chainContext,
+        chain_context: chainContext,
         ...extraInputs,
       };
       await this.executeSkill(executor, skill.id, inputs, ticket);
@@ -248,6 +273,7 @@ export class AgentManager extends EventEmitter {
       is_current: true,
     });
     this.store.addChainNode(ticketId, thinkingNode);
+    await this.relayNode(ticket, thinkingNode);
     this.sendWS({ type: 'agent.thinking', ticket_id: ticketId, agent_id: this.config.agent.name, payload: { skill_id: skillId }, timestamp: now() });
 
     // KB lookup event (if RAG is non-empty)
@@ -271,6 +297,7 @@ export class AgentManager extends EventEmitter {
         is_current: true,
       });
       this.store.addChainNode(ticketId, kbNode);
+      await this.relayNode(ticket, kbNode);
       this.sendWS({ type: 'agent.kb_lookup_complete', ticket_id: ticketId, agent_id: this.config.agent.name, payload: kbNode.payload, timestamp: now() });
     }
 
@@ -291,15 +318,21 @@ export class AgentManager extends EventEmitter {
       is_current: true,
     });
     this.store.addChainNode(ticketId, skillNode);
+    await this.relayNode(ticket, skillNode);
     this.sendWS({ type: 'agent.skill_complete', ticket_id: ticketId, agent_id: this.config.agent.name, payload: { skill_id: skillId, success: result.success, output: result.output, execution_time_ms: result.execution_time_ms }, timestamp: now() });
 
     // Routing evaluation
     if (ticket && result.success) {
-      const decision = this.router.evaluate(ticket, 'skill_output', result.output);
-      if (decision.action === 'escalate') {
-        await this.escalate(ticket, decision.reason, decision.target_agent);
-      } else if (result.output['decision'] === 'RESOLVE' || result.output['status'] === 'resolved') {
+      const resolveOnSkill = this.config.routing?.resolve_on_skill;
+      if (resolveOnSkill && resolveOnSkill === skillId) {
         await this.resolve(ticket, result.output);
+      } else {
+        const decision = this.router.evaluate(ticket, 'skill_output', result.output, skillId);
+        if (decision.action === 'escalate') {
+          await this.escalate(ticket, decision.reason, decision.target_agent);
+        } else if (result.output['decision'] === 'RESOLVE' || result.output['status'] === 'resolved') {
+          await this.resolve(ticket, result.output);
+        }
       }
     }
 
@@ -309,20 +342,55 @@ export class AgentManager extends EventEmitter {
   private async escalate(ticket: Ticket, reason: string, targetAgent?: string | undefined): Promise<void> {
     this.store.updateTicket(ticket.id, { status: 'l2' });
 
+    const target = targetAgent ?? this.config.routing?.escalate_to ?? 'escalation-queue';
     const handoff: AgentChainHandoff = {
       id: uid('ho'),
       ticket_id: ticket.id,
       from_participant: this.config.agent.name,
       from_label: this.config.agent.display_name,
-      to_participant: targetAgent ?? 'escalation-queue',
-      to_label: targetAgent ?? 'Escalation Queue',
+      to_participant: target,
+      to_label: target,
       timestamp: now(),
       label: reason,
     };
     this.store.addChainHandoff(ticket.id, handoff);
+    await this.relayHandoff(ticket, handoff);
 
-    this.sendWS({ type: 'ticket.escalated', ticket_id: ticket.id, agent_id: this.config.agent.name, payload: { reason, target_agent: targetAgent ?? '' }, timestamp: now() });
-    this.emit('ticket.escalated', { ticket_id: ticket.id, reason, target_agent: targetAgent });
+    this.sendWS({ type: 'ticket.escalated', ticket_id: ticket.id, agent_id: this.config.agent.name, payload: { reason, target_agent: target }, timestamp: now() });
+    this.emit('ticket.escalated', { ticket_id: ticket.id, reason, target_agent: target });
+
+    // Forward ticket to peer agent if URL is configured
+    const peerUrl = this.config.routing?.peer_agents?.[target];
+    if (peerUrl) {
+      // relay_to is either this ticket's coordinator or (if this is the coordinator) our own URL
+      const ownUrl = `http://localhost:${this.config.interface?.api_port ?? 8001}`;
+      const relayTo = (ticket.metadata?.['relay_to'] as string | undefined) ?? ownUrl;
+      // Build cumulative chain context so the next agent can see all previous findings
+      const prevContext = ticket.metadata?.['chain_context'] as string | undefined ?? '';
+      const myNodes = this.store.getChainNodes(ticket.id)
+        .filter(n => n.node_type === 'l1_analysis' && n.participant_id === this.config.agent.name);
+      const myOutput = myNodes.length > 0 ? JSON.stringify(myNodes[myNodes.length - 1]?.payload ?? {}, null, 2) : '';
+      const chainContext = prevContext
+        ? `${prevContext}\n\n## ${this.config.agent.display_name} Findings\n${myOutput}`
+        : `## ${this.config.agent.display_name} Findings\n${myOutput}`;
+      try {
+        await fetch(`${peerUrl}/api/tickets`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            id: ticket.id,
+            title: ticket.title,
+            description: ticket.description ?? '',
+            priority: ticket.priority,
+            raised_by: ticket.raised_by,
+            relay_to: relayTo,
+            metadata: { chain_context: chainContext },
+          }),
+        });
+      } catch (err) {
+        console.warn(`[AgentManager] Failed to forward ticket to peer ${target} at ${peerUrl}:`, err);
+      }
+    }
   }
 
   private async resolve(ticket: Ticket, output: Record<string, unknown>): Promise<void> {
@@ -344,8 +412,33 @@ export class AgentManager extends EventEmitter {
       is_current: true,
     });
     this.store.addChainNode(ticket.id, resolutionNode);
+    await this.relayNode(ticket, resolutionNode);
     this.sendWS({ type: 'ticket.resolved', ticket_id: ticket.id, agent_id: this.config.agent.name, payload: resolutionNode.payload, timestamp: now() });
     this.emit('ticket.resolved', { ticket_id: ticket.id });
+  }
+
+  private async relayNode(ticket: Ticket | undefined, node: AgentChainNode): Promise<void> {
+    const relayTo = ticket?.metadata?.['relay_to'] as string | undefined;
+    if (!relayTo) return;
+    try {
+      await fetch(`${relayTo}/api/tickets/${node.ticket_id}/chain-relay`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kind: 'node', node }),
+      });
+    } catch { /* best-effort relay */ }
+  }
+
+  private async relayHandoff(ticket: Ticket | undefined, handoff: AgentChainHandoff): Promise<void> {
+    const relayTo = ticket?.metadata?.['relay_to'] as string | undefined;
+    if (!relayTo) return;
+    try {
+      await fetch(`${relayTo}/api/tickets/${handoff.ticket_id}/chain-relay`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kind: 'handoff', handoff }),
+      });
+    } catch { /* best-effort relay */ }
   }
 
   private scheduleEscalationTimer(ticket: Ticket): void {
@@ -354,7 +447,7 @@ export class AgentManager extends EventEmitter {
     setTimeout(async () => {
       if (!this.running) return;
       const current = this.store.getTicket(ticket.id);
-      if (!current || current.status === 'resolved') return;
+      if (!current || current.status !== 'open') return;
       const target = this.config.routing?.escalate_to;
       await this.escalate(current, `Auto-escalated after ${mins} minutes`, target);
     }, mins * 60 * 1000);

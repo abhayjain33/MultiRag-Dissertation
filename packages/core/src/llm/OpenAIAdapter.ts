@@ -7,6 +7,7 @@ import type { LLMConfig } from '../config/schemas.js';
 export class OpenAIAdapter implements LLMProvider {
   protected client: OpenAI;
   private model: string;
+  private embeddingModel: string;
   private defaultTemperature: number;
   private defaultMaxTokens: number;
   private systemPrompt: string | undefined;
@@ -16,8 +17,15 @@ export class OpenAIAdapter implements LLMProvider {
       throw new Error('OpenAIAdapter requires provider: openai or azure');
     }
     const apiKey = config.api_key ? resolveEnvVar(config.api_key) : undefined;
-    this.client = clientOverride ?? new OpenAI({ ...(apiKey !== undefined ? { apiKey } : {}) });
+    const baseURL = config.base_url ? resolveEnvVar(config.base_url) : undefined;
+    this.client =
+      clientOverride ??
+      new OpenAI({
+        ...(apiKey !== undefined ? { apiKey } : {}),
+        ...(baseURL !== undefined ? { baseURL } : {}),
+      });
     this.model = config.model;
+    this.embeddingModel = config.embedding_model ?? 'text-embedding-3-small';
     this.defaultTemperature = config.temperature;
     this.defaultMaxTokens = config.max_tokens;
     this.systemPrompt = config.system_prompt;
@@ -99,7 +107,7 @@ export class OpenAIAdapter implements LLMProvider {
   async embed(texts: string[]): Promise<number[][]> {
     const response = await withRetry(() =>
       this.client.embeddings.create({
-        model: 'text-embedding-3-small',
+        model: this.embeddingModel,
         input: texts,
       }),
     );
