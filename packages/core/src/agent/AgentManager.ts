@@ -58,8 +58,15 @@ export class AgentManager extends EventEmitter {
       : this.llm;
 
     // 3. Knowledge sources + RAG
+    // Resolve each source's `path` against the config file's directory so that
+    // relative paths (e.g. ../kb/known-errors.md) work regardless of the cwd the
+    // agent process was launched from.
     this.rag = new RAGPipeline(this.embedder);
-    for (const src of this.config.knowledge?.sources ?? []) {
+    for (const rawSrc of this.config.knowledge?.sources ?? []) {
+      const src =
+        'path' in rawSrc && rawSrc.path
+          ? { ...rawSrc, path: resolve(this.configDir, rawSrc.path) }
+          : rawSrc;
       if (src.type === 'markdown') {
         const p = new MarkdownProcessor(src, this.embedder);
         await p.index();

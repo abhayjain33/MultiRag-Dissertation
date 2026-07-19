@@ -74,6 +74,13 @@ export class MarkdownProcessor {
   }
 
   private async findFiles(): Promise<string[]> {
+    // The configured path may be either a single .md file or a directory.
+    const root = this.source.path;
+    const rootStat = await stat(root).catch(() => null);
+    if (rootStat?.isFile()) {
+      return extname(root) === '.md' ? [root] : [];
+    }
+
     const files: string[] = [];
     const walk = async (dir: string): Promise<void> => {
       let entries: string[];
@@ -86,7 +93,7 @@ export class MarkdownProcessor {
         else if (extname(entry) === '.md') files.push(full);
       }
     };
-    await walk(this.source.path);
+    await walk(root);
     return files;
   }
 
